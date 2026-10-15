@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>抖音爆款雷达</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">D</span><div><strong>爆款雷达</strong><small>本地数据工作台</small></div></div>
+    <nav>
+      <button class="nav active" data-page="collect"><span>⌁</span>作者采集</button>
+      <button class="nav" data-page="videos"><span>▦</span>视频数据库</button>
+      <button class="nav" data-page="lowfans"><span>↗</span>低粉爆款</button>
+      <button class="nav" data-page="topics"><span>◇</span>选题库</button>
+      <button class="nav" data-page="transcripts"><span>◉</span>文案识别</button>
+      <button class="nav" data-page="settings"><span>⚙</span>设置</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="status-dot"></div><span id="modeLabel">演示模式</span>
+      <small>数据仅保存在本机</small>
+    </div>
+  </aside>
+
+  <main>
+    <header><div><p class="eyebrow">DOUYIN INTELLIGENCE</p><h1 id="pageTitle">作者作品采集</h1></div><div class="header-actions"><span id="keyBadge" class="badge warn">未配置密钥</span><button class="ghost" id="refreshBtn">刷新</button></div></header>
+
+    <section id="page-collect" class="page active">
+      <div class="hero-card">
+        <div><span class="kicker">灵活采集</span><h2>全量、指定页数或只采最新一页</h2><p>自动记录 Cursor、与历史数据去重。增量采集只保存新视频，也只为新增视频补充数据。</p></div>
+        <div class="input-stack">
+          <div class="collect-options"><div><label for="authorHistory">已采集作者</label><select id="authorHistory"><option value="">新作者 / 手动输入</option></select></div><div><label for="collectMode">采集范围</label><select id="collectMode"><option value="all">采集全部作品</option><option value="pages">指定采集页数</option><option value="latest">只采最新一页</option></select></div><div id="pageCountWrap" class="hidden"><label for="pageCount">采集页数</label><input id="pageCount" type="number" min="1" max="999" value="3"></div></div>
+          <label for="authorUrl">抖音作者主页链接</label>
+          <div class="input-row"><input id="authorUrl" value="https://www.douyin.com/user/MS4wLjABAAAA8STS6_M6xDdyhaTpeC5wuitJkGrSqohI1TeGYq0UBWNwqGcnImByfUKqAo8vy72s?from_tab_name=main"><button class="primary" id="collectBtn">开始采集</button><button class="danger hidden" id="stopBtn">停止</button></div>
+          <p class="hint">真实采集前请在“设置”中关闭演示模式并填写 TikHub 密钥。</p>
+        </div>
+      </div>
+      <div class="metrics">
+        <article><span>已收录视频</span><strong id="metricVideos">0</strong><small>本地去重后</small></article>
+        <article><span>当前翻页</span><strong id="metricPage">—</strong><small>Cursor 自动续传</small></article>
+        <article><span>有播放数据</span><strong id="metricStats">0</strong><small>可计算互动率</small></article>
+        <article><span>已识别文案</span><strong id="metricTranscript">0</strong><small>Qwen3-ASR</small></article>
+      </div>
+      <div class="panel"><div class="panel-head"><div><h3>任务进度</h3><p id="progressText">等待开始</p></div><span id="progressCount" class="mono">0 条</span></div><div class="progress"><i id="progressBar"></i></div><div id="eventLog" class="event-log"><div><time>—</time><span>客户端已就绪</span></div></div></div>
+    </section>
+
+    <section id="page-videos" class="page">
+      <div class="toolbar"><select id="authorFilter" class="author-filter"><option value="">全部作者</option></select><div class="searchbox"><span>⌕</span><input id="videoFilter" placeholder="搜索标题、作者或视频 ID"></div><button class="secondary" id="statsBtn">补全播放数据</button><button class="secondary" id="exportVideosBtn">导出 CSV</button><button class="ghost danger-text" id="clearBtn">清空数据</button></div>
+      <div class="panel table-panel"><div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="selectAll"></th><th>视频</th><th>播放量</th><th>点赞率</th><th>收藏率</th><th>分享率</th><th>发布时间</th><th>操作</th></tr></thead><tbody id="videoTable"></tbody></table></div><div class="empty" id="videoEmpty">还没有视频，先去采集一个作者。</div></div>
+    </section>
+
+    <section id="page-lowfans" class="page">
+      <div class="hero-card compact"><div><span class="kicker">关键词洞察</span><h2>查找小账号的大爆款</h2><p>按关键词和时间窗口查询 TikHub 低粉爆款榜。</p></div><div class="input-stack"><label>搜索关键词</label><div class="input-row"><input id="lowKeyword" value="AI创意视频"><select id="dateWindow"><option value="1">近 1 小时</option><option value="24" selected>近 1 天</option><option value="72">近 3 天</option><option value="168">近 7 天</option></select><button class="primary" id="lowSearchBtn">开始搜索</button></div></div></div>
+      <div class="toolbar right"><button class="secondary" id="exportLowBtn">导出结果</button></div>
+      <div class="cards-grid" id="lowFanGrid"></div><div class="empty" id="lowEmpty">输入关键词开始搜索。</div>
+    </section>
+
+    <section id="page-topics" class="page">
+      <div class="library-head"><div><span class="kicker">IDEA LIBRARY</span><h2>把值得借鉴的作品留在这里</h2><p>选题库独立保存在本机；原视频列表被清空后，已收藏的选题仍会保留。</p></div><div><strong id="topicCount">0</strong><small>个选题</small></div></div>
+      <div class="toolbar"><div class="searchbox"><span>⌕</span><input id="topicFilter" placeholder="搜索选题、作者或视频 ID"></div><button class="secondary" id="exportTopicsBtn">导出选题库</button></div>
+      <div class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>选题作品</th><th>原文与改写</th><th>数据表现</th><th>加入时间</th><th>管理</th></tr></thead><tbody id="topicTable"></tbody></table></div><div class="empty" id="topicEmpty">暂时没有选题，可在视频列表或低粉爆款中加入。</div></div>
+    </section>
+
+    <section id="page-transcripts" class="page">
+      <div class="notice"><strong>每次识别都重新取直链</strong><span>点击识别后，客户端会先向 TikHub 获取本次最新公网播放地址，再提交给 Qwen3-ASR，不会复用过期链接。</span></div>
+      <div class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>视频</th><th>识别状态</th><th>文案预览</th><th>操作</th></tr></thead><tbody id="transcriptTable"></tbody></table></div><div class="empty" id="transcriptEmpty">采集视频后可在这里一键识别文案。</div></div>
+    </section>
+
+    <section id="page-settings" class="page">
+      <div class="settings-grid">
+        <div class="panel form-panel"><div class="panel-head"><div><h3>密钥与接口</h3><p>密钥使用 Windows 本机加密保存，界面不会回显。</p></div></div>
+          <label>TikHub API Key <span id="tikhubState"></span></label><input id="tikhubKey" type="password" autocomplete="off" placeholder="留空表示不修改">
+          <label>阿里云 DashScope API Key <span id="dashscopeState"></span></label><input id="dashscopeKey" type="password" autocomplete="off" placeholder="留空表示不修改">
+          <label>DeepSeek API Key <span id="deepseekState"></span></label><input id="deepseekKey" type="password" autocomplete="off" placeholder="留空表示不修改">
+          <label>TikHub API 地址</label><input id="tikhubBaseUrl">
+          <label>DashScope API 基础地址</label><input id="dashscopeBaseUrl"><p class="hint">新版百炼推荐填写含 Workspace ID 的专属地域地址，并以 /api/v1 结尾。</p>
+          <label>DeepSeek API 基础地址</label><input id="deepseekBaseUrl"><p class="hint">官方 OpenAI 兼容地址默认为 https://api.deepseek.com。</p>
+        </div>
+        <div class="panel form-panel"><div class="panel-head"><div><h3>采集策略</h3><p>默认值已经按需求设置。</p></div></div>
+          <div class="two-col"><div><label>最大重试次数</label><input id="retryCount" type="number" min="1" max="30"></div><div><label>重试间隔（毫秒）</label><input id="retryDelayMs" type="number" min="1000" step="100"></div></div>
+          <label>视频 CDN 地区</label><select id="region"><option value="CN">中国大陆（CN）</option><option value="HK">中国香港（HK）</option><option value="US">美国（US）</option></select>
+          <label class="switch-row"><span><strong>演示模式</strong><small>不调用真实接口，用模拟数据验证流程</small></span><input id="demoMode" type="checkbox" class="switch"></label>
+          <label class="switch-row"><span><strong>采集完成后自动补播放量</strong><small>批量统计接口会产生额外费用</small></span><input id="autoStats" type="checkbox" class="switch"></label>
+          <button class="primary full" id="saveSettingsBtn">保存设置</button>
+        </div>
+        <div class="panel form-panel prompt-panel"><div class="panel-head"><div><h3>爆款文案改写提示词</h3><p>该提示词会作为 DeepSeek-V4-Pro 的 system 消息，每次改写都会使用。</p></div><button class="primary" id="promptSaveBtn">保存提示词</button></div>
+          <label for="rewriteSystemPrompt">系统提示词</label><textarea id="rewriteSystemPrompt" rows="14" placeholder="请输入改写规则"></textarea>
+        </div>
+      </div>
+      <div class="security-note"><span>◆</span><div><strong>密钥安全</strong><p>密钥不会写入源码、导出文件或普通日志。程序只向对应服务的 HTTPS 接口发送密钥。</p></div></div>
+    </section>
+  </main>
+
+  <div id="rewriteModal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><span class="kicker">DEEPSEEK-V4-PRO</span><h2 id="rewriteModalTitle">改写结果</h2></div><button class="modal-close" id="closeRewriteModal">×</button></div><div id="rewriteModalBody" class="rewrite-results"></div></div></div>
+
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
