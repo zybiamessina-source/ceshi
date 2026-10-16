@@ -1,16 +1,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { ApiClient } = require('../src/lib/api');
+const { ApiClient, TaskCancelledError } = require('../src/lib/api');
 
 function memoryStore() {
   const store = {
-    state: { settings: { demoMode: true, autoStats: false, deepseekBaseUrl: 'https://api.deepseek.com', rewriteSystemPrompt: '请改写文案' }, videos: [], authors: [], topics: [], collection: null },
+    state: { settings: { demoMode: true, autoStats: false, retryCount: 2, retryDelayMs: 1000, deepseekBaseUrl: 'https://api.deepseek.com', dashscopeBaseUrl: 'https://dashscope.aliyuncs.com/api/v1', rewriteSystemPrompt: '请改写文案' }, videos: [], authors: [], topics: [], searches: [], collection: null, collectionTasks: {}, asrTasks: {} },
     getSecret() { return 'test-secret'; },
     save() {},
     upsertVideos(items) {
       const map = new Map(this.state.videos.map((item) => [String(item.id), item]));
       items.forEach((item) => map.set(String(item.id), { ...(map.get(String(item.id)) || {}), ...item }));
       this.state.videos = [...map.values()];
+      return this.state.videos.filter((item) => items.some((changed) => String(changed.id) === String(item.id)));
     },
     upsertAuthor(author) {
       const index = this.state.authors.findIndex((item) => item.secUserId === author.secUserId);
@@ -28,7 +29,20 @@ function memoryStore() {
       topic.rewrites = [rewrite, ...(topic.rewrites || [])];
       topic.latestRewrite = rewrite.text;
       return topic;
-    }
+    },
+    saveCollection(value) {
+      const key = value.secUserId || value.url;
+      this.state.collectionTasks[key] = { ...(this.state.collectionTasks[key] || {}), ...value };
+      this.state.collection = this.state.collectionTasks[key];
+      return this.state.collection;
+    },
+    getCollection(key) { return this.state.collectionTasks[key] || null; },
+    saveAsrTask(value) {
+      this.state.asrTasks[value.awemeId] = { ...(this.state.asrTasks[value.awemeId] || {}), ...value };
+      return this.state.asrTasks[value.awemeId];
+    },
+    getAsrTask(id) { return this.state.asrTasks[id] || null; },
+    setSearches(items) { this.state.searches = items; }
   };
   return store;
 }
@@ -78,4 +92,86 @@ test('真实改写按官方 Chat Completions 格式调用 deepseek-v4-pro', asyn
   assert.equal(request.body.thinking.type, 'disabled');
   assert.equal(request.authorization, 'Bearer test-secret');
   assert.equal(result.rewrite.text, '这是一段全新的改写文案。');
+});
+
+test('401 密钥错误立即停止，不执行无效重试或备用接口', async () => {
+  const store = memoryStore();
+  store.state.settings.demoMode = false;
+  const client = new ApiClient(store);
+  let calls = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({ ok: false, status: 401, text: async () => JSON.stringify({ message: 'invalid key' }) });
+  try {
+    await assert.rejects(() => client.withFallback([
+      () => client.request('https://example.com/a', {}, '测试接口'),
+      () => { calls += 100; }
+    ], '测试'), /请求失败/);
+    assert.equal(calls, 0);
+  } finally { global.fetch = originalFetch; }
+});
+
+test('服务端临时错误按设置重试后成功', async () => {
+  const store = memoryStore();
+  store.state.settings.demoMode = false;
+  const client = new ApiClient(store);
+  client.wait = async () => {};
+  let calls = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return { ok: false, status: 500, text: async () => JSON.stringify({ message: 'temporary' }) };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ code: 200, data: { ok: true } }) };
+  };
+  try {
+    const result = await client.request('https://example.com/a', {}, '测试接口');
+    assert.equal(result.data.ok, true);
+    assert.equal(calls, 2);
+  } finally { global.fetch = originalFetch; }
+});
+
+test('全量采集按作者恢复各自保存的 Cursor', async () => {
+  const store = memoryStore();
+  store.state.settings.demoMode = false;
+  store.saveCollection({ secUserId: 'author-a', url: 'https://www.douyin.com/user/author-a', cursor: 77, page: 2, complete: false });
+  store.saveCollection({ secUserId: 'author-b', url: 'https://www.douyin.com/user/author-b', cursor: 99, page: 8, complete: false });
+  const client = new ApiClient(store);
+  client.resolveAuthor = async () => 'author-a';
+  let requestedCursor;
+  client.authorPage = async (_id, cursor) => {
+    requestedCursor = cursor;
+    return { data: { aweme_list: [{ aweme_id: 'new-1', desc: '新作品' }], max_cursor: 88, has_more: 0 } };
+  };
+  const result = await client.collectAuthor('https://www.douyin.com/user/author-a', { mode: 'all' });
+  assert.equal(requestedCursor, 77);
+  assert.equal(result.resumed, true);
+  assert.equal(store.getCollection('author-a').page, 3);
+  assert.equal(store.getCollection('author-b').cursor, 99);
+});
+
+test('ASR 重启续查已有任务号，不重复获取直链或提交', async () => {
+  const store = memoryStore();
+  store.state.settings.demoMode = false;
+  store.saveAsrTask({ awemeId: 'video-asr', taskId: 'existing-task', status: 'PAUSED' });
+  const client = new ApiClient(store);
+  client.wait = async () => {};
+  client.latestPlayUrl = async () => { throw new Error('不应重新获取直链'); };
+  const calls = [];
+  client.request = async (url) => {
+    calls.push(url);
+    return { output: { task_status: 'SUCCEEDED' }, result: { text: '恢复后取得的识别文案' } };
+  };
+  const result = await client.transcribe('video-asr');
+  assert.equal(result.transcript, '恢复后取得的识别文案');
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /\/tasks\/existing-task$/);
+  assert.equal(store.getAsrTask('video-asr').status, 'SUCCEEDED');
+});
+
+test('取消信号会立即结束接口任务且不再重试', async () => {
+  const store = memoryStore();
+  store.state.settings.demoMode = false;
+  const controller = new AbortController();
+  controller.abort();
+  const client = new ApiClient(store, () => {}, { signal: controller.signal });
+  await assert.rejects(() => client.request('https://example.com', {}, '取消测试'), TaskCancelledError);
 });

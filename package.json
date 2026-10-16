@@ -1,20 +1,20 @@
 {
   "name": "douyin-radar-local",
-  "version": "0.3.1",
+  "version": "1.1.0",
   "description": "本地抖音爆款采集与文案识别客户端",
   "main": "src/main.js",
   "author": "Local User",
   "license": "UNLICENSED",
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/parser.test.js test/api.test.js test/store.test.js",
+    "test": "set ELECTRON_RUN_AS_NODE=1&& electron --test test/parser.test.js test/api.test.js test/store.test.js",
     "pack": "electron-builder --win portable --x64",
     "installer": "electron-builder --win nsis --x64",
     "dist": "electron-builder --win nsis portable --x64"
   },
   "devDependencies": {
-    "electron": "^38.2.2",
-    "electron-builder": "24.13.3"
+    "electron": "44.8.0",
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "local.douyin.radar",
@@ -40,6 +40,8 @@
     "nsis": {
       "artifactName": "抖音爆款雷达-${version}-安装版.exe",
       "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,

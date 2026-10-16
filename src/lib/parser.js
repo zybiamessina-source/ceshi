@@ -50,11 +50,37 @@ function findMetric(node, keys) {
   return number(firstByKeys(node, keys, (v) => v !== null && v !== '' && !Number.isNaN(Number(v))));
 }
 
+function findOptionalMetric(node, keys) {
+  const value = firstByKeys(node, keys, (v) => v !== null && v !== '' && !Number.isNaN(Number(v)));
+  return value === undefined ? undefined : number(value);
+}
+
 function normalizeVideo(item, source = 'author') {
   const id = firstByKeys(item, ['aweme_id', 'awemeId', 'item_id', 'itemId', 'video_id', 'id'], (v) => typeof v === 'string' || typeof v === 'number');
   if (!id) return null;
   const author = firstByKeys(item, ['author', 'user', 'author_info'], (v) => v && typeof v === 'object') || {};
   const stats = firstByKeys(item, ['statistics', 'statistics_data', 'stats', 'statistics_info'], (v) => v && typeof v === 'object') || item;
+  if (source === 'stats') {
+    const result = { id: String(id), source };
+    const metrics = {
+      play: ['play_count', 'playCount', 'view_count', 'views', 'play_cnt'],
+      like: ['digg_count', 'like_count', 'likeCount', 'likes', 'like_cnt'],
+      collect: ['collect_count', 'collection_count', 'favorite_count', 'favorites', 'collect_cnt'],
+      share: ['share_count', 'shareCount', 'shares', 'share_cnt'],
+      comment: ['comment_count', 'commentCount', 'comments', 'comment_cnt']
+    };
+    for (const [name, keys] of Object.entries(metrics)) {
+      const value = findOptionalMetric(stats, keys);
+      if (value !== undefined) result[name] = value;
+    }
+    if (result.play !== undefined) {
+      if (result.like !== undefined) result.likeRate = result.play ? result.like / result.play : null;
+      if (result.collect !== undefined) result.collectRate = result.play ? result.collect / result.play : null;
+      if (result.share !== undefined) result.shareRate = result.play ? result.share / result.play : null;
+      if (result.comment !== undefined) result.commentRate = result.play ? result.comment / result.play : null;
+    }
+    return result;
+  }
   const title = firstByKeys(item, ['desc', 'description', 'title', 'aweme_desc', 'item_title'], (v) => typeof v === 'string') || '';
   const nickname = firstByKeys(author, ['nickname', 'nick_name', 'name'], (v) => typeof v === 'string')
     || firstByKeys(item, ['nickname', 'nick_name'], (v) => typeof v === 'string') || '';

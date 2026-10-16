@@ -1,7 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
-const state = { videos: [], authors: [], topics: [], lowFans: [], settings: {}, busy: false };
+const state = { videos: [], authors: [], topics: [], lowFans: [], settings: {}, busy: false, currentTask: null };
 const titles = { collect: '作者作品采集', videos: '视频数据库', lowfans: '低粉爆款榜', topics: '选题库', transcripts: '视频文案识别', settings: '设置与安全' };
 
 function toast(message, error = false) {
@@ -95,6 +95,7 @@ function renderSettings() {
   $('#region').value = s.region || 'CN';
   $('#demoMode').checked = Boolean(s.demoMode);
   $('#autoStats').checked = Boolean(s.autoStats);
+  $('#customEndpointConsent').checked = Boolean(s.customEndpointConsent);
   $('#tikhubState').textContent = s.hasTikhubKey ? '（已保存）' : '（未填写）';
   $('#dashscopeState').textContent = s.hasDashscopeKey ? '（已保存）' : '（未填写）';
   $('#deepseekState').textContent = s.hasDeepseekKey ? '（已保存）' : '（未填写）';
@@ -102,6 +103,8 @@ function renderSettings() {
   const ready = s.hasTikhubKey && s.hasDashscopeKey && s.hasDeepseekKey;
   $('#keyBadge').textContent = ready ? '密钥已配置' : '密钥待配置';
   $('#keyBadge').className = `badge${ready ? '' : ' warn'}`;
+  $('#databaseVersion').textContent = s.databaseVersion ? `SQLite v${s.databaseVersion}` : '—';
+  $('#lastBackupAt').textContent = s.lastBackupAt ? new Date(s.lastBackupAt).toLocaleString('zh-CN') : '尚无记录';
 }
 
 function logEvent(message) {
@@ -114,10 +117,12 @@ async function reload() {
   const data = unwrap(await window.radar.listVideos());
   state.videos = data.videos || [];
   state.authors = data.authors || [];
+  state.lowFans = data.searches || [];
   state.topics = unwrap(await window.radar.listTopics()) || [];
   renderAuthors();
   renderMetrics(data.collection);
   renderVideos();
+  renderLowFans();
   renderTopics();
 }
 
@@ -208,9 +213,50 @@ async function saveSettings() {
       tikhubBaseUrl: $('#tikhubBaseUrl').value.trim(), dashscopeBaseUrl: $('#dashscopeBaseUrl').value.trim(), deepseekBaseUrl: $('#deepseekBaseUrl').value.trim(),
       rewriteSystemPrompt: $('#rewriteSystemPrompt').value.trim(),
       retryCount: Math.min(30, Math.max(1, Number($('#retryCount').value))), retryDelayMs: Math.max(1000, Number($('#retryDelayMs').value)),
-      region: $('#region').value, demoMode: $('#demoMode').checked, autoStats: $('#autoStats').checked
+      region: $('#region').value, demoMode: $('#demoMode').checked, autoStats: $('#autoStats').checked,
+      customEndpointConsent: $('#customEndpointConsent').checked
     }));
     $('#tikhubKey').value = ''; $('#dashscopeKey').value = ''; $('#deepseekKey').value = ''; renderSettings(); toast('设置已安全保存');
+  } catch (error) { toast(error.message, true); }
+}
+
+async function clearSecret(name) {
+  const labels = { tikhub: 'TikHub', dashscope: '阿里云 DashScope', deepseek: 'DeepSeek' };
+  if (!confirm(`确定清除本机保存的 ${labels[name] || name} 密钥吗？`)) return;
+  try {
+    state.settings = unwrap(await window.radar.clearSecret(name));
+    renderSettings();
+    toast('密钥已清除');
+  } catch (error) { toast(error.message, true); }
+}
+
+async function backupData() {
+  try {
+    const result = unwrap(await window.radar.backupData());
+    if (result.canceled) return;
+    state.settings = unwrap(await window.radar.getSettings());
+    renderSettings();
+    toast('完整数据备份已保存');
+  } catch (error) { toast(error.message, true); }
+}
+
+async function restoreData() {
+  if (!confirm('恢复备份会替换当前客户端数据。系统会先自动备份当前数据，是否继续？')) return;
+  try {
+    const result = unwrap(await window.radar.restoreData());
+    if (result.canceled) return;
+    state.settings = unwrap(await window.radar.getSettings());
+    renderSettings();
+    await reload();
+    toast('备份恢复完成');
+  } catch (error) { toast(error.message, true); }
+}
+
+async function cancelCurrentTask() {
+  if (!state.currentTask) return;
+  try {
+    const result = unwrap(await window.radar.cancelTask({ type: state.currentTask.type, target: state.currentTask.target }));
+    toast(result.cancelled ? '正在取消任务，已完成的进度会保留' : '当前没有可取消的任务');
   } catch (error) { toast(error.message, true); }
 }
 
@@ -230,6 +276,9 @@ $('#statsBtn').addEventListener('click', refreshStats);
 $('#lowSearchBtn').addEventListener('click', searchLowFans);
 $('#saveSettingsBtn').addEventListener('click', saveSettings);
 $('#promptSaveBtn').addEventListener('click', saveSettings);
+$('#backupBtn').addEventListener('click', backupData);
+$('#restoreBtn').addEventListener('click', restoreData);
+$('#cancelTaskBtn').addEventListener('click', cancelCurrentTask);
 $('#closeRewriteModal').addEventListener('click', closeRewriteModal);
 $('#rewriteModal').addEventListener('click', (event) => { if (event.target.id === 'rewriteModal') closeRewriteModal(); });
 $('#selectAll').addEventListener('change', (event) => $$('.row-check').forEach((node) => node.checked = event.target.checked));
@@ -239,7 +288,9 @@ document.addEventListener('click', (event) => {
   const removeButton = event.target.closest('.remove-topic');
   const rewriteButton = event.target.closest('.rewrite-topic');
   const viewButton = event.target.closest('.view-rewrites');
-  if (transcribeButton) transcribe(transcribeButton.dataset.id);
+  const clearSecretButton = event.target.closest('.clear-secret');
+  if (clearSecretButton) clearSecret(clearSecretButton.dataset.secret);
+  else if (transcribeButton) transcribe(transcribeButton.dataset.id);
   else if (addButton) addTopic(addButton.dataset.id);
   else if (removeButton) removeTopic(removeButton.dataset.id);
   else if (rewriteButton) rewriteTopic(rewriteButton.dataset.id);
@@ -249,7 +300,24 @@ $('#exportVideosBtn').addEventListener('click', async () => { try { const result
 $('#exportLowBtn').addEventListener('click', async () => { try { const result = unwrap(await window.radar.exportCsv(state.lowFans, '低粉爆款数据')); if (!result.canceled) toast('CSV 已导出'); } catch (e) { toast(e.message, true); } });
 $('#exportTopicsBtn').addEventListener('click', async () => { try { const result = unwrap(await window.radar.exportCsv(state.topics, '选题库')); if (!result.canceled) toast('选题库已导出'); } catch (e) { toast(e.message, true); } });
 $('#clearBtn').addEventListener('click', async () => { if (confirm('确定清空本机采集数据吗？密钥和设置不会被删除。')) { unwrap(await window.radar.clearData()); await reload(); toast('本地数据已清空'); } });
-window.radar.onProgress((event) => { logEvent(event.message || '任务更新'); $('#progressText').textContent = event.message || '处理中'; if (event.count) { $('#progressCount').textContent = `${event.count} 条`; $('#progressBar').style.width = `${Math.min(90, 15 + event.page * 8)}%`; } });
+window.radar.onProgress((event) => {
+  logEvent(event.message || '任务更新');
+  $('#progressText').textContent = event.message || '处理中';
+  if (event.type === 'task') {
+    if (event.status === 'running') {
+      state.currentTask = { type: event.taskType, target: event.target };
+      $('#cancelTaskBtn').classList.remove('hidden');
+      $('#progressBar').style.width = '12%';
+    } else if (state.currentTask?.type === event.taskType && state.currentTask?.target === event.target) {
+      state.currentTask = null;
+      $('#cancelTaskBtn').classList.add('hidden');
+    }
+  }
+  if (event.count) {
+    $('#progressCount').textContent = `${event.count} 条`;
+    $('#progressBar').style.width = `${Math.min(90, 15 + event.page * 8)}%`;
+  }
+});
 
 (async () => {
   try { state.settings = unwrap(await window.radar.getSettings()); renderSettings(); await reload(); }

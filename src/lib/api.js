@@ -3,48 +3,87 @@ const { randomUUID } = require('node:crypto');
 const { parseSecUserId, parseVideoPage, parseStats, parsePlayUrl, parseLowFans, recalc, firstByKeys } = require('./parser');
 
 class ApiError extends Error {
-  constructor(message, details = '') {
+  constructor(message, details = '', options = {}) {
     super(message);
     this.details = details;
+    this.status = options.status || 0;
+    this.retryable = options.retryable ?? false;
+    this.fallbackEligible = options.fallbackEligible ?? true;
+  }
+}
+
+class TaskCancelledError extends ApiError {
+  constructor(message = '任务已取消，当前进度已保存') {
+    super(message, '', { retryable: false, fallbackEligible: false });
+    this.name = 'TaskCancelledError';
   }
 }
 
 class ApiClient {
-  constructor(store, progress = () => {}) {
+  constructor(store, progress = () => {}, options = {}) {
     this.store = store;
     this.progress = progress;
+    this.signal = options.signal || null;
   }
 
   settings() { return this.store.state.settings; }
+
+  checkCancelled() {
+    if (this.signal?.aborted) throw new TaskCancelledError();
+  }
+
+  async wait(milliseconds) {
+    this.checkCancelled();
+    try { await delay(milliseconds, undefined, this.signal ? { signal: this.signal } : undefined); }
+    catch (error) { if (this.signal?.aborted || error?.name === 'AbortError') throw new TaskCancelledError(); throw error; }
+  }
+
+  classifyHttp(status) {
+    if ([401, 403].includes(status)) return { retryable: false, fallbackEligible: false };
+    if ([400, 404, 405, 409, 422].includes(status)) return { retryable: false, fallbackEligible: true };
+    if ([408, 425, 429].includes(status) || status >= 500) return { retryable: true, fallbackEligible: true };
+    return { retryable: false, fallbackEligible: true };
+  }
 
   async request(url, options = {}, label = '接口') {
     const attempts = Math.max(1, Number(this.settings().retryCount) || 30);
     let lastError;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      this.checkCancelled();
       try {
-        const response = await fetch(url, { ...options, signal: AbortSignal.timeout(60000) });
+        const timeoutSignal = AbortSignal.timeout(60000);
+        const signal = this.signal ? AbortSignal.any([this.signal, timeoutSignal]) : timeoutSignal;
+        const response = await fetch(url, { ...options, signal });
         const text = await response.text();
         let body;
-        try { body = text ? JSON.parse(text) : {}; } catch { throw new ApiError(`${label}返回了无法解析的数据`, `HTTP ${response.status}`); }
+        try { body = text ? JSON.parse(text) : {}; }
+        catch { throw new ApiError(`${label}返回了无法解析的数据`, `HTTP ${response.status}`, { status: response.status, retryable: response.ok || response.status >= 500 }); }
         if (!response.ok) {
           const rawResponseMessage = body.message_zh || body.message || body.detail || body.error?.message || '';
           const responseMessage = typeof rawResponseMessage === 'object' ? JSON.stringify(rawResponseMessage) : rawResponseMessage;
-          throw new ApiError(`${label}请求失败`, `HTTP ${response.status}${responseMessage ? `：${responseMessage}` : ''}`);
+          const classification = this.classifyHttp(response.status);
+          throw new ApiError(`${label}请求失败`, `HTTP ${response.status}${responseMessage ? `：${responseMessage}` : ''}`, { status: response.status, ...classification });
         }
         const code = body.code ?? body.status_code;
         if (code && ![0, 200, '0', '200', 'ok', 'success'].includes(code)) {
-          throw new ApiError(`${label}返回失败`, String(body.message || body.detail || code));
+          const message = String(body.message || body.detail || code);
+          const authFailure = /密钥|授权|认证|unauthor|forbidden|invalid.?key/i.test(message);
+          throw new ApiError(`${label}返回失败`, message, { retryable: !authFailure, fallbackEligible: !authFailure });
         }
         return body;
       } catch (error) {
-        lastError = error;
-        if (attempt < attempts) {
-          this.progress({ type: 'retry', message: `${label}失败，1 秒后重试（${attempt}/${attempts}）` });
-          await delay(Number(this.settings().retryDelayMs) || 1000);
-        }
+        if (this.signal?.aborted || error instanceof TaskCancelledError) throw new TaskCancelledError();
+        lastError = error instanceof ApiError
+          ? error
+          : new ApiError(`${label}网络连接失败`, error?.name === 'TimeoutError' ? '请求超时' : String(error?.message || '网络错误'), { retryable: true });
+        if (!lastError.retryable || attempt >= attempts) break;
+        const waitMs = Math.max(1000, Number(this.settings().retryDelayMs) || 1000);
+        this.progress({ type: 'retry', message: `${label}失败，${Math.ceil(waitMs / 1000)} 秒后重试（${attempt}/${attempts}）` });
+        await this.wait(waitMs);
       }
     }
-    throw new ApiError(`${label}连续重试 ${attempts} 次仍然失败`, lastError?.details || lastError?.message || '未知错误');
+    if (!lastError?.retryable) throw lastError;
+    throw new ApiError(`${label}连续重试 ${attempts} 次仍然失败`, lastError?.details || lastError?.message || '未知错误', { status: lastError?.status, fallbackEligible: lastError?.fallbackEligible });
   }
 
   async tikhub(path, { method = 'GET', query, body, label } = {}) {
@@ -66,6 +105,7 @@ class ApiClient {
       try { return await endpoints[index](); }
       catch (error) {
         lastError = error;
+        if (error?.fallbackEligible === false || error instanceof TaskCancelledError) throw error;
         if (index < endpoints.length - 1) this.progress({ type: 'fallback', message: `${actionName}主接口不可用，正在切换备用接口` });
       }
     }
@@ -100,14 +140,19 @@ class ApiClient {
     const pageLimit = mode === 'latest' ? 1 : (mode === 'pages' ? Math.max(1, Number(options.pages) || 1) : Infinity);
     if (this.settings().demoMode) return this.demoAuthor(url, { mode, pages: pageLimit });
     const secUserId = await this.resolveAuthor(url);
-    const previous = this.store.state.collection;
-    let cursor = mode === 'all' && previous?.url === url && !previous?.complete ? previous.cursor : 0;
+    const previous = this.store.getCollection?.(secUserId)
+      || this.store.state.collectionTasks?.[secUserId]
+      || (this.store.state.collection?.url === url ? this.store.state.collection : null);
+    const resuming = mode === 'all' && previous && !previous.complete;
+    let cursor = resuming ? previous.cursor : 0;
     let page = 0;
+    const previousPages = resuming ? Number(previous.page || 0) : 0;
     const seenCursors = new Set();
     const newVideos = [];
     const existingIds = new Set(this.store.state.videos.map((video) => String(video.id)));
     let nickname = this.store.state.authors.find((author) => author.secUserId === secUserId)?.nickname || '';
     while (!shouldStop() && page < pageLimit) {
+      this.checkCancelled();
       const payload = await this.authorPage(secUserId, cursor);
       const parsed = parseVideoPage(payload);
       page += 1;
@@ -118,8 +163,13 @@ class ApiClient {
       newVideos.push(...unseen);
       this.store.upsertVideos(mode === 'latest' ? unseen : enriched);
       const reachedLimit = page >= pageLimit;
-      this.store.state.collection = { url, secUserId, nickname, cursor: parsed.cursor, page, mode, complete: !parsed.hasMore || reachedLimit, updatedAt: new Date().toISOString() };
-      this.store.save();
+      const collection = {
+        url, secUserId, nickname, cursor: parsed.cursor, page: previousPages + page, sessionPages: page, mode,
+        complete: !parsed.hasMore, sessionComplete: !parsed.hasMore || reachedLimit,
+        updatedAt: new Date().toISOString()
+      };
+      if (this.store.saveCollection) this.store.saveCollection(collection);
+      else { this.store.state.collection = collection; this.store.save(); }
       this.progress({ type: 'collection', page, count: this.store.state.videos.length, newCount: newVideos.length, message: `已完成第 ${page} 页，本页 ${parsed.videos.length} 条，新增 ${unseen.length} 条` });
       const cursorKey = String(parsed.cursor ?? '');
       if (reachedLimit || !parsed.hasMore || !cursorKey || seenCursors.has(cursorKey)) break;
@@ -131,7 +181,7 @@ class ApiClient {
     }
     this.store.upsertAuthor({ secUserId, nickname: nickname || '未知作者', url, videoCount: this.store.state.videos.filter((video) => video.authorKey === secUserId).length, lastMode: mode });
     if (this.settings().autoStats && newVideos.length) await this.refreshStats(newVideos.map((v) => v.id));
-    return { count: newVideos.length, scanned: page, stopped: shouldStop(), mode, videos: this.store.state.videos };
+    return { count: newVideos.length, scanned: page, stopped: shouldStop() || Boolean(this.signal?.aborted), mode, resumed: Boolean(resuming), videos: this.store.state.videos };
   }
 
   async refreshStats(ids) {
@@ -157,9 +207,10 @@ class ApiClient {
       result.push(...(payload.__parsed || parseStats(payload)));
       this.progress({ type: 'stats', message: `已补全 ${Math.min(index + 50, selected.length)}/${selected.length} 条播放数据` });
     }
-    const merged = result.map(recalc);
-    this.store.upsertVideos(merged);
-    return merged;
+    const updated = this.store.upsertVideos(result);
+    if (Array.isArray(updated)) return updated;
+    const idsUpdated = new Set(result.map((item) => String(item.id)));
+    return this.store.state.videos.filter((item) => idsUpdated.has(String(item.id)));
   }
 
   async latestPlayUrl(awemeId) {
@@ -182,22 +233,35 @@ class ApiClient {
     }
     const key = this.store.getSecret('dashscope');
     if (!key) throw new ApiError('尚未填写阿里云 DashScope 密钥');
-    const audioUrl = await this.latestPlayUrl(awemeId);
     const base = this.settings().dashscopeBaseUrl.replace(/\/$/, '');
-    const submit = await this.request(`${base}/services/audio/asr/transcription`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-DashScope-Async': 'enable' },
-      body: JSON.stringify({ model: 'qwen3-asr-flash-filetrans', input: { file_url: audioUrl }, parameters: { channel_id: [0], enable_itn: true, enable_words: false } })
-    }, '提交 Qwen3-ASR');
-    const taskId = submit.output?.task_id;
-    if (!taskId) throw new ApiError('ASR 没有返回任务 ID');
+    let saved = this.store.getAsrTask?.(awemeId) || this.store.state.asrTasks?.[String(awemeId)] || null;
+    let taskId = saved?.taskId;
+    if (!taskId || ['FAILED', 'UNKNOWN', 'SUCCEEDED'].includes(saved?.status)) {
+      this.progress({ type: 'asr', message: '正在获取最新视频直链…' });
+      const audioUrl = await this.latestPlayUrl(awemeId);
+      this.checkCancelled();
+      const submit = await this.request(`${base}/services/audio/asr/transcription`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'X-DashScope-Async': 'enable' },
+        body: JSON.stringify({ model: 'qwen3-asr-flash-filetrans', input: { file_url: audioUrl }, parameters: { channel_id: [0], enable_itn: true, enable_words: false } })
+      }, '提交 Qwen3-ASR');
+      taskId = submit.output?.task_id;
+      if (!taskId) throw new ApiError('ASR 没有返回任务 ID');
+      saved = { awemeId: String(awemeId), taskId, status: 'SUBMITTED', submittedAt: new Date().toISOString() };
+      this.store.saveAsrTask?.(saved);
+    } else {
+      this.progress({ type: 'asr', message: '发现未完成的识别任务，正在继续查询，不会重复提交' });
+    }
+
     for (let poll = 0; poll < 360; poll += 1) {
-      await delay(2000);
-      const status = await this.request(`${base}/tasks/${encodeURIComponent(taskId)}`, { headers: { Authorization: `Bearer ${key}` } }, '查询 ASR 任务');
-      const state = status.output?.task_status;
-      this.progress({ type: 'asr', message: `文案识别状态：${state || '处理中'}` });
-      if (state === 'FAILED' || state === 'UNKNOWN') throw new ApiError('Qwen3-ASR 识别失败', status.output?.message || status.message || state);
-      if (state === 'SUCCEEDED') {
+      await this.wait(poll === 0 && saved?.status === 'SUBMITTED' ? 2000 : 2000);
+      try {
+        const status = await this.request(`${base}/tasks/${encodeURIComponent(taskId)}`, { headers: { Authorization: `Bearer ${key}` } }, '查询 ASR 任务');
+        const state = status.output?.task_status || 'RUNNING';
+        this.store.saveAsrTask?.({ awemeId: String(awemeId), taskId, status: state, lastPolledAt: new Date().toISOString() });
+        this.progress({ type: 'asr', message: `文案识别状态：${state || '处理中'}` });
+        if (state === 'FAILED' || state === 'UNKNOWN') throw new ApiError('Qwen3-ASR 识别失败', status.output?.message || status.message || state);
+        if (state !== 'SUCCEEDED') continue;
         const transcriptUrl = firstByKeys(status, ['transcription_url'], (v) => typeof v === 'string');
         let result = status;
         if (transcriptUrl) result = await this.request(transcriptUrl, {}, '下载识别结果');
@@ -211,9 +275,16 @@ class ApiClient {
         const transcript = [...new Set(sentences)].join('\n').trim();
         if (!transcript) throw new ApiError('识别完成，但结果中没有找到文案', '需要用真实返回数据校准字段');
         this.store.upsertVideos([{ id: awemeId, transcript, transcriptStatus: '完成' }]);
-        return { transcript };
+        this.store.saveAsrTask?.({ awemeId: String(awemeId), taskId, status: 'SUCCEEDED', completedAt: new Date().toISOString() });
+        return { transcript, resumed: Boolean(saved?.taskId) };
+      } catch (error) {
+        if (error instanceof TaskCancelledError) {
+          this.store.saveAsrTask?.({ awemeId: String(awemeId), taskId, status: 'PAUSED' });
+        }
+        throw error;
       }
     }
+    this.store.saveAsrTask?.({ awemeId: String(awemeId), taskId, status: 'PAUSED' });
     throw new ApiError('Qwen3-ASR 等待超时', '任务可能仍在阿里云后台执行');
   }
 
@@ -268,13 +339,18 @@ class ApiClient {
   }
 
   async searchLowFans({ keyword, page = 1, pageSize = 20, dateWindow = 24 }) {
-    if (this.settings().demoMode) return this.demoLowFans(keyword);
+    if (this.settings().demoMode) {
+      const items = this.demoLowFans(keyword);
+      if (this.store.setSearches) this.store.setSearches(items);
+      else { this.store.state.searches = items; this.store.save(); }
+      return items;
+    }
     const payload = await this.tikhub('/api/v1/douyin/billboard/fetch_hot_total_low_fan_list', {
       method: 'POST', body: { page, page_size: pageSize, date_window: dateWindow, keyword, tags: [] }, label: '低粉爆款榜'
     });
     const items = parseLowFans(payload);
-    this.store.state.searches = items;
-    this.store.save();
+    if (this.store.setSearches) this.store.setSearches(items);
+    else { this.store.state.searches = items; this.store.save(); }
     return items;
   }
 
@@ -291,10 +367,11 @@ class ApiClient {
     const videos = options.mode === 'latest' ? catalog.filter((video) => !existingIds.has(video.id)) : catalog;
     this.store.upsertVideos(videos);
     this.store.upsertAuthor({ secUserId, nickname: '演示作者', url, videoCount: this.store.state.videos.filter((video) => video.authorKey === secUserId).length, lastMode: options.mode || 'all' });
-    this.store.state.collection = { url, secUserId, nickname: '演示作者', cursor: null, page: options.mode === 'latest' ? 1 : Math.ceil(total / 6), mode: options.mode || 'all', complete: true, demo: true };
-    this.store.save();
-    this.progress({ type: 'collection', page: this.store.state.collection.page, count: this.store.state.videos.length, newCount: videos.length, message: `演示采集完成，新增 ${videos.length} 条` });
-    return { count: videos.length, scanned: this.store.state.collection.page, mode: options.mode || 'all', videos: this.store.state.videos, demo: true };
+    const collection = { url, secUserId, nickname: '演示作者', cursor: null, page: options.mode === 'latest' ? 1 : Math.ceil(total / 6), mode: options.mode || 'all', complete: true, demo: true };
+    if (this.store.saveCollection) this.store.saveCollection(collection);
+    else { this.store.state.collection = collection; this.store.save(); }
+    this.progress({ type: 'collection', page: collection.page, count: this.store.state.videos.length, newCount: videos.length, message: `演示采集完成，新增 ${videos.length} 条` });
+    return { count: videos.length, scanned: collection.page, mode: options.mode || 'all', videos: this.store.state.videos, demo: true };
   }
 
   demoLowFans(keyword) {
@@ -306,4 +383,4 @@ class ApiClient {
   }
 }
 
-module.exports = { ApiClient, ApiError };
+module.exports = { ApiClient, ApiError, TaskCancelledError };
